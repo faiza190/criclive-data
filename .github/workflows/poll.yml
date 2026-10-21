@@ -1,0 +1,124 @@
+name: Poll CricketData feed
+
+# Polls the CricketData API and publishes the raw responses as static JSON
+# for the CricLive app to read. The API key lives ONLY in the CRICAPI_KEY
+# repo secret — never in a file. ~76 API calls/day total (every 20 min for
+# current matches + every 6h for fixtures), comfortably inside the free
+# 100/day quota no matter how many app installs read the feed.
+#
+# Backoff: if the API reports a block, no further calls are made until the
+# backoff window passes (8h for an exhausted daily quota, 30 min for a short
+# rate-limit block), so a blocked day wastes almost no calls.
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Poll API and publish feed
+        env:
+          CRICAPI_KEY: ${{ secrets.CRICAPI_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import datetime
+          import json
+          import os
+          import subprocess
+          import time
+          import urllib.request
+
+          KEY = os.environ['CRICAPI_KEY']
+          META = 'meta.json'
+
+          def api_get(path):
+              url = f'https://api.cricapi.com/v1/{path}?apikey={KEY}&offset=0'
+              req = urllib.request.Request(url, headers={'User-Agent': 'criclive-feed-poller/1.0'})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          def load_meta():
+              try:
+                  with open(META) as f:
+                      return json.load(f)
+              except (FileNotFoundError, json.JSONDecodeError):
+                  return {}
+
+          def save_meta(meta):
+              with open(META, 'w') as f:
+                  json.dump(meta, f)
+
+          def git(*args):
+              subprocess.run(['git', *args], check=True)
+
+          now = time.time()
+          meta = load_meta()
+          if meta.get('backoff_until', 0) > now:
+              print('In backoff until', meta['backoff_until'], '- skipping poll.')
+              raise SystemExit(0)
+
+          changed = False
+          try:
+              cur = api_get('currentMatches')
+          except Exception as e:  # noqa: BLE001 - network failure -> backoff path
+              cur = {'status': 'failure', 'reason': f'transport: {e}'}
+
+          if cur.get('status') == 'success':
+              cur['fetched_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              with open('currentMatches.json', 'w') as f:
+                  json.dump(cur, f)
+              meta.pop('backoff_until', None)
+              meta.pop('last_reason', None)
+              changed = True
+              print('currentMatches updated:', len(cur.get('data', [])), 'matches')
+          else:
+              reason = str(cur.get('reason', 'unknown'))
+              # Daily quota exhausted -> sleep 8h; short rate block -> 30 min.
+              wait = 8 * 3600 if 'hits today exceeded' in reason else 1800
+              meta['backoff_until'] = now + wait
+              meta['last_reason'] = reason
+              changed = True
+              print('API blocked:', reason, '-> backing off', wait // 60, 'min')
+
+          save_meta(meta)
+
+          # Fixtures/results change rarely: refresh every 6h, never in backoff.
+          hour = datetime.datetime.now(datetime.timezone.utc).hour
+          if 'backoff_until' not in meta and hour % 6 == 0:
+              try:
+                  allm = api_get('matches')
+              except Exception as e:  # noqa: BLE001
+                  allm = {'status': 'failure', 'reason': f'transport: {e}'}
+              if allm.get('status') == 'success':
+                  allm['fetched_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                  with open('matches.json', 'w') as f:
+                      json.dump(allm, f)
+                  changed = True
+                  print('matches.json updated:', len(allm.get('data', [])), 'matches')
+              else:
+                  print('matches fetch failed:', allm.get('reason'))
+
+          if not changed:
+              print('No changes to publish.')
+              raise SystemExit(0)
+
+          git('config', 'user.name', 'criclive-poller')
+          git('config', 'user.email', 'criclive-poller@users.noreply.github.com')
+          git('add', '-A')
+          diff = subprocess.run(['git', 'diff', '--cached', '--quiet'])
+          if diff.returncode != 0:
+              stamp = time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime())
+              git('commit', '-m', f'feed update {stamp}')
+              git('push')
+              print('Pushed feed update.')
+          else:
+              print('Nothing new to commit.')
+          PYEOF
