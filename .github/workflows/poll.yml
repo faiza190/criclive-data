@@ -56,6 +56,17 @@ jobs:
               with open(META, 'w') as f:
                   json.dump(meta, f)
 
+          def publish(path, payload):
+              # The API echoes the key back inside its responses and this
+              # repo is public: strip it (plus any nested occurrence) before
+              # anything is written to disk.
+              payload.pop('apikey', None)
+              text = json.dumps(payload)
+              if KEY in text:
+                  text = text.replace(KEY, 'REDACTED')
+              with open(path, 'w') as f:
+                  f.write(text)
+
           def git(*args):
               subprocess.run(['git', *args], check=True)
 
@@ -73,8 +84,7 @@ jobs:
 
           if cur.get('status') == 'success':
               cur['fetched_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-              with open('currentMatches.json', 'w') as f:
-                  json.dump(cur, f)
+              publish('currentMatches.json', cur)
               meta.pop('backoff_until', None)
               meta.pop('last_reason', None)
               changed = True
@@ -99,8 +109,7 @@ jobs:
                   allm = {'status': 'failure', 'reason': f'transport: {e}'}
               if allm.get('status') == 'success':
                   allm['fetched_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                  with open('matches.json', 'w') as f:
-                      json.dump(allm, f)
+                  publish('matches.json', allm)
                   changed = True
                   print('matches.json updated:', len(allm.get('data', [])), 'matches')
               else:
